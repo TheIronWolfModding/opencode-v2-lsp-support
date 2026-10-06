@@ -80,6 +80,7 @@ async function report(manager: LspManager, root: string, event: Completed, chang
       continue // untitled: and other non-file URIs have no path to report
     }
     if (files.includes(file)) continue
+    if (!(await insideProject(root, file))) continue
     const block = diagnosticsReport(file, diagnostics)
     if (block) elsewhere.push(block)
   }

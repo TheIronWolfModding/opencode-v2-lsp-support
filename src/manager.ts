@@ -1,6 +1,8 @@
 import { access, open, readFile, realpath, stat } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path"
 import { pathToFileURL } from "node:url"
+import { setTimeout as delay } from "node:timers/promises"
+import { abortable } from "./cancellation.ts"
 import { BUILTIN_ROOTS, languageIdForExtension } from "./catalog.ts"
 import { LspClient, LspError, errorMessage, type Diagnostic } from "./client.ts"
 import type { ServerConfig, Settings } from "./config.ts"
@@ -166,9 +168,10 @@ export class LspManager {
   }
 
   /** Start any missing servers for the file and send them its current contents. */
-  sync(file: string): Promise<Synced[]> {
+  async sync(file: string, signal?: AbortSignal): Promise<Synced[]> {
+    signal?.throwIfAborted()
     const uri = pathToFileURL(file).href
-    return this.#serialize(uri, () => this.#sync(file, uri))
+    return abortable(this.#serialize(uri, () => this.#sync(file, uri, signal)), signal)
   }
 
   /**
@@ -189,16 +192,29 @@ export class LspManager {
     })
   }
 
-  async #sync(file: string, uri: string): Promise<Synced[]> {
+  async #sync(file: string, uri: string, signal?: AbortSignal): Promise<Synced[]> {
+    signal?.throwIfAborted()
     // OpenCode 1 asked before touching files outside the project; plugins cannot ask, so they are never sent.
     const text = await readInside(this.#root, file)
+    signal?.throwIfAborted()
+    const ready: { target: Target; client: LspClient }[] = []
+    for (const target of await this.#targets(file)) {
+      signal?.throwIfAborted()
+      // Initialization is shared; cancelling one tool must not break another caller's server.
+      const client = await abortable(this.#client(target).catch(() => undefined), signal)
+      signal?.throwIfAborted()
+      if (client) ready.push({ target, client })
+    }
+    signal?.throwIfAborted()
+    if (this.#closed) throw new Error("LSP is shut down")
+    if (ready.length === 0) return []
+    // Commit the version only after startup finishes, then notify every client without
+    // yielding. A cancelled startup must not make their last actual reports stale.
     const version = (this.#versions.get(uri) ?? 0) + 1
     this.#versions.set(uri, version)
     this.#deleted.delete(uri)
     const synced: Synced[] = []
-    for (const target of await this.#targets(file)) {
-      const client = await this.#client(target).catch(() => undefined)
-      if (!client) continue
+    for (const { target, client } of ready) {
       const entry = this.#entries.get(target.key)!
       const sentAt = Date.now()
       if (entry.opened.has(uri)) {
@@ -211,21 +227,26 @@ export class LspManager {
       }
       // Edit tools write to disk, and some servers (rust-analyzer, for one) only re-check on save.
       const save = client.capabilities.textDocumentSync?.save
-      client.notify("textDocument/didSave", save?.includeText ? { textDocument: { uri }, text } : { textDocument: { uri } })
+      if (save === true || (save && typeof save === "object")) {
+        client.notify("textDocument/didSave", save?.includeText ? { textDocument: { uri }, text } : { textDocument: { uri } })
+      }
       synced.push({ client, version, sentAt })
     }
     return synced
   }
 
   /** Sync the file and wait for its diagnostics. */
-  async diagnostics(file: string, timeoutMs = this.#settings.diagnosticsTimeoutMs): Promise<FileDiagnostics> {
+  async diagnostics(file: string, timeoutMs = this.#settings.diagnosticsTimeoutMs, signal?: AbortSignal): Promise<FileDiagnostics> {
+    signal?.throwIfAborted()
     const uri = pathToFileURL(file).href
-    const synced = await this.sync(file).catch((error) => {
+    const synced = await this.sync(file, signal).catch((error) => {
+      signal?.throwIfAborted()
       this.#log(`${file}: ${errorMessage(error)}`)
       return []
     })
     // Reports from before this file's contents reached the server describe older contents.
-    const reports = await Promise.all(synced.map(({ client, version, sentAt }) => this.#collect(client, uri, version, sentAt, timeoutMs)))
+    const reports = await Promise.all(synced.map(({ client, version, sentAt }) => this.#collect(client, uri, version, sentAt, timeoutMs, signal)))
+    signal?.throwIfAborted()
     const reported = reports.filter((report): report is Diagnostic[] => report !== undefined)
     const others = new Map<string, Diagnostic[]>()
     for (const { client, sentAt } of synced) {
@@ -237,16 +258,23 @@ export class LspManager {
     return { file: reported.length ? reported.flat() : undefined, others }
   }
 
-  async #collect(client: LspClient, uri: string, version: number, since: number, timeoutMs: number): Promise<Diagnostic[] | undefined> {
+  async #collect(client: LspClient, uri: string, version: number, since: number, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | undefined> {
+    signal?.throwIfAborted()
     if (client.capabilities.diagnosticProvider) {
       try {
         // A pull answers for the contents the server held when the request arrived. Sending it from
         // the file's queue pins that version; if a later sync replaced it meanwhile, ask again.
         for (let attempt = 0; attempt < PULL_ATTEMPTS; attempt++) {
-          const { sent, response } = await this.#serialize(uri, async () => ({
-            sent: this.#versions.get(uri),
-            response: client.request("textDocument/diagnostic", { textDocument: { uri } }, Math.min(timeoutMs, PULL_TIMEOUT_MS)),
-          }))
+          const { sent, response } = await abortable(this.#serialize(uri, async () => {
+            signal?.throwIfAborted()
+            const response = client.request("textDocument/diagnostic", { textDocument: { uri } }, Math.min(timeoutMs, PULL_TIMEOUT_MS), signal)
+            // Cancellation can win before the queue returns this nested promise to its caller.
+            void response.catch(() => undefined)
+            return {
+              sent: this.#versions.get(uri),
+              response,
+            }
+          }), signal)
           const report = await response
           if (this.#deleted.has(uri)) return undefined
           if (sent === undefined || this.#versions.get(uri) !== sent) continue
@@ -258,16 +286,18 @@ export class LspManager {
           break
         }
       } catch (error) {
+        signal?.throwIfAborted()
         this.#log(`${client.id}: pull diagnostics failed, waiting for a push: ${errorMessage(error)}`)
       }
     }
     // An older report describes the file before this change, so no report beats a stale one.
-    return this.#waitForPush(client.id, uri, version, since, timeoutMs)
+    return this.#waitForPush(client.id, uri, version, since, timeoutMs, signal)
   }
 
   /** Resolve once the server has published for this version and gone quiet, or undefined on timeout. */
-  #waitForPush(serverID: string, uri: string, version: number, since: number, timeoutMs: number): Promise<Diagnostic[] | undefined> {
-    return new Promise((resolve) => {
+  #waitForPush(serverID: string, uri: string, version: number, since: number, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | undefined> {
+    signal?.throwIfAborted()
+    return new Promise((resolve, reject) => {
       let settle: ReturnType<typeof setTimeout> | undefined
       const current = () => {
         const published = this.#published.get(serverID)?.get(uri)
@@ -275,11 +305,19 @@ export class LspManager {
         if (published.version !== undefined && published.version < version) return undefined
         return published
       }
-      const finish = () => {
+      const cleanup = () => {
         clearTimeout(timeout)
         if (settle) clearTimeout(settle)
         this.#listeners.get(serverID)?.delete(listener)
+        signal?.removeEventListener("abort", abort)
+      }
+      const finish = () => {
+        cleanup()
         resolve(current()?.diagnostics)
+      }
+      const abort = () => {
+        cleanup()
+        reject(signal!.reason)
       }
       // Any message from the server restarts the quiet period, so an early empty
       // result from a server that is still indexing is not taken as clean.
@@ -292,6 +330,7 @@ export class LspManager {
       const listeners = this.#listeners.get(serverID) ?? new Set()
       listeners.add(listener)
       this.#listeners.set(serverID, listeners)
+      signal?.addEventListener("abort", abort, { once: true })
       listener()
     })
   }
@@ -300,13 +339,15 @@ export class LspManager {
    * Run `send` against every server for the file that has the capability, and
    * concatenate their results. Throws when none can answer.
    */
-  async request(file: string, capability: string, send: (client: LspClient) => Promise<unknown>): Promise<unknown[]> {
+  async request(file: string, capability: string, send: (client: LspClient) => Promise<unknown>, signal?: AbortSignal): Promise<unknown[]> {
+    signal?.throwIfAborted()
     if (this.serversFor(file).length === 0) throw new Error("No LSP server available for this file type.")
-    const targets = await this.#targets(file)
+    const targets = await abortable(this.#targets(file), signal)
     if (targets.length === 0) throw new Error("No configured LSP server applies to this file's project.")
     const cold = targets.some((target) => !this.#entries.get(target.key)?.warmed)
-    if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS)
-    else await this.sync(file)
+    if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS, signal)
+    else await this.sync(file, signal)
+    signal?.throwIfAborted()
     const clients: LspClient[] = []
     for (const target of targets) {
       const entry = this.#entries.get(target.key)
@@ -407,13 +448,20 @@ export class LspManager {
 }
 
 /** Send a request, retrying while the server reports it is still loading. */
-export async function requestWithRetry(client: LspClient, method: string, params: unknown): Promise<unknown> {
+export async function requestWithRetry(client: LspClient, method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
   for (let attempt = 1; ; attempt++) {
+    signal?.throwIfAborted()
     try {
-      return await client.request(method, params)
+      return await client.request(method, params, undefined, signal)
     } catch (error) {
+      signal?.throwIfAborted()
       if (attempt >= 5 || !(error instanceof LspError) || !TRANSIENT_CODES.has(error.code ?? 0)) throw error
-      await new Promise((resolve) => setTimeout(resolve, 400 * attempt))
+      try {
+        await delay(400 * attempt, undefined, { signal })
+      } catch (error) {
+        signal?.throwIfAborted()
+        throw error
+      }
     }
   }
 }

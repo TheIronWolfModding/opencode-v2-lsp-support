@@ -72,9 +72,12 @@ export function lspTool(manager: LspManager, root: string) {
       additionalProperties: false,
     },
     options: { codemode: false, permission: "lsp" },
-    async execute(input: Input) {
+    async execute(input: Input, context: { signal?: AbortSignal } = {}) {
+      const { signal } = context
+      signal?.throwIfAborted()
       const file = await resolveFile(root, input.path)
-      const content = await run(manager, root, file, input)
+      signal?.throwIfAborted()
+      const content = await run(manager, root, file, input, signal)
       return {
         content: content || `No results found for ${input.operation}`,
         metadata: { operation: input.operation, path: displayPath(file, root) },
@@ -83,14 +86,14 @@ export function lspTool(manager: LspManager, root: string) {
   }
 }
 
-async function run(manager: LspManager, root: string, file: string, input: Input): Promise<string> {
+async function run(manager: LspManager, root: string, file: string, input: Input, signal?: AbortSignal): Promise<string> {
   const textDocument = { uri: pathToFileURL(file).href }
   const position = () => {
     if (!input.line || !input.character) throw new Error(`${input.operation} needs line and character.`)
     return { line: input.line - 1, character: input.character - 1 }
   }
   const ask = (capability: string, method: string, params: Record<string, unknown>) =>
-    manager.request(file, capability, (client) => requestWithRetry(client, method, params))
+    manager.request(file, capability, (client) => requestWithRetry(client, method, params, signal), signal)
   const list = (lines: string[]) => lines.join("\n")
 
   switch (input.operation) {
@@ -123,17 +126,17 @@ async function run(manager: LspManager, root: string, file: string, input: Input
       const at = position()
       // The follow-up request must go to the server that produced the item.
       const lines = await manager.request(file, "callHierarchyProvider", async (client: LspClient) => {
-        const items = await requestWithRetry(client, "textDocument/prepareCallHierarchy", { textDocument, position: at })
+        const items = await requestWithRetry(client, "textDocument/prepareCallHierarchy", { textDocument, position: at }, signal)
         if (!Array.isArray(items)) return []
         const method = incoming ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls"
-        const results = await Promise.all(items.map((item) => requestWithRetry(client, method, { item })))
+        const results = await Promise.all(items.map((item) => requestWithRetry(client, method, { item }, signal)))
         // Outgoing call sites are in the prepared item's file, which may not be the requested one.
         return results.flatMap((result, index) => {
           const item = items[index]
           const caller = typeof item?.uri === "string" && item.uri.startsWith("file:") ? fileURLToPath(item.uri) : file
           return Array.isArray(result) ? result.flatMap((call) => formatCall(call, incoming, caller, root) ?? []) : []
         })
-      })
+      }, signal)
       return list(lines as string[])
     }
     default:

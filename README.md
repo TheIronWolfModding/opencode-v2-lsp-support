@@ -42,6 +42,8 @@ See [examples/opencode.jsonc](examples/opencode.jsonc) for portable Python, Type
 - Starts servers lazily and warms them on file reads; uses one server process per server ID and detected root.
 - Closes deleted and moved-away documents and shuts down servers when the plugin unloads.
 - Rejects navigation paths outside the plugin's project directory, including symlinks to outside files; checks opened files before sending their contents.
+- Filters other-file diagnostic reports to existing files inside the project, including symlink checks.
+- Cancels navigation requests and diagnostic warm-up when OpenCode stops a tool, without shutting down servers shared by other callers.
 
 ### Tool inputs
 
@@ -93,6 +95,7 @@ The values shown are the defaults. `diagnostics: false` disables post-edit repor
 - Only errors are appended to tool results; warnings and hints are omitted. Missing diagnostic severity is treated as an error. Reports are capped at 20 errors per file and five other files; workspace symbol results are capped at 20.
 - Diagnostics are best-effort. A silent or failed server leaves the edit result unchanged; a navigation request explains a startup failure. A server that fails to start stays disabled for that plugin instance until it reloads.
 - Cold-start initialization and navigation warm-up can take longer than the configured diagnostics wait.
+- Save notifications require an explicit `textDocumentSync.save` capability. Legacy numeric-only sync capabilities do not receive them; servers that rely on save-only checks must advertise save support.
 - The plugin checks which document contents it sends; it does **not** sandbox the server process or stop a server from scanning dependencies outside the project. Servers run with the OpenCode service's OS privileges and inherited environment. Only load trusted code and configure trusted commands; debug output may include server messages and paths.
 
 ## Test

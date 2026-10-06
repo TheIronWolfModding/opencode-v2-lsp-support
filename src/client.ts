@@ -21,7 +21,7 @@ export interface Diagnostic {
 interface Pending {
   resolve: (value: any) => void
   reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
+  cleanup: () => void
 }
 
 /** A JSON-RPC error that keeps the server's code, so callers can retry transient failures. */
@@ -129,8 +129,12 @@ export class LspClient {
     }
   }
 
-  request(method: string, params: unknown, timeoutMs = this.#options.requestTimeoutMs): Promise<any> {
+  request(method: string, params: unknown, timeoutMs = this.#options.requestTimeoutMs, signal?: AbortSignal): Promise<any> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason)
+        return
+      }
       if (!this.#child) {
         reject(new Error(`${this.id}: server is not running`))
         return
@@ -138,9 +142,21 @@ export class LspClient {
       const id = this.#nextId++
       const timer = setTimeout(() => {
         this.#pending.delete(id)
+        cleanup()
         reject(new Error(`${this.id}: ${method} timed out after ${timeoutMs}ms`))
       }, timeoutMs)
-      this.#pending.set(id, { resolve, reject, timer })
+      const abort = () => {
+        this.#pending.delete(id)
+        cleanup()
+        this.notify("$/cancelRequest", { id })
+        reject(signal!.reason)
+      }
+      const cleanup = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener("abort", abort)
+      }
+      this.#pending.set(id, { resolve, reject, cleanup })
+      signal?.addEventListener("abort", abort, { once: true })
       this.#send({ jsonrpc: "2.0", id, method, params })
     })
   }
@@ -173,7 +189,7 @@ export class LspClient {
 
   #rejectPending(error: Error): void {
     for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timer)
+      pending.cleanup()
       pending.reject(error)
     }
     this.#pending.clear()
@@ -216,7 +232,7 @@ export class LspClient {
     if (message.id !== undefined && message.method === undefined) {
       const pending = this.#pending.get(message.id)
       if (!pending) return
-      clearTimeout(pending.timer)
+      pending.cleanup()
       this.#pending.delete(message.id)
       if (message.error) pending.reject(new LspError(`${this.id}: ${message.error.message ?? "request failed"}`, message.error.code))
       else pending.resolve(message.result)

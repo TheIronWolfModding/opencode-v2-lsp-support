@@ -11,7 +11,8 @@ import { pathToFileURL } from "node:url"
 const PLUGIN = pathToFileURL(resolve(process.argv[2] ?? new URL(".", import.meta.url).pathname) + "/")
 const { default: plugin } = await import(new URL("index.ts", PLUGIN))
 const { resolveSettings } = await import(new URL("src/config.ts", PLUGIN))
-const { serverRoot } = await import(new URL("src/manager.ts", PLUGIN))
+const { LspManager, serverRoot, requestWithRetry } = await import(new URL("src/manager.ts", PLUGIN))
+const { LspError } = await import(new URL("src/client.ts", PLUGIN))
 
 const cases = []
 const test = (name, run) => cases.push({ name, run })
@@ -47,6 +48,9 @@ const changed = (uri, version, text) => {
       const other = new URL("other.ts", uri).href
       send({ method: "textDocument/publishDiagnostics", params: { uri: "untitled:scratch.ts", diagnostics: diagnose("ERROR unsaved") } })
       send({ method: "textDocument/publishDiagnostics", params: { uri: other, diagnostics: diagnose("ERROR elsewhere") } })
+      for (const extra of JSON.parse(process.env.FAKE_OTHER_URIS ?? "[]")) {
+        send({ method: "textDocument/publishDiagnostics", params: { uri: extra, diagnostics: diagnose("ERROR outside") } })
+      }
     }
   }, text.includes("DELAYED") ? 700 : 20)
 }
@@ -55,19 +59,19 @@ const item = (name, uri, line) => ({ name, kind: 12, uri, range: at(uri, line, 0
 const handle = (message) => {
   const { id, method, params } = message
   const uri = params?.textDocument?.uri
-  if (process.env.FAKE_LOG && method?.startsWith("textDocument/did")) {
-    const text = params.textDocument.text ?? params.contentChanges?.[0]?.text ?? ""
-    appendFileSync(process.env.FAKE_LOG, JSON.stringify({ method, uri, version: params.textDocument.version, outside: text.includes("OUTSIDE") }) + "\n")
+  if (process.env.FAKE_LOG && (method?.startsWith("textDocument/") || method === "$/cancelRequest" || method === "initialize")) {
+    const text = params?.textDocument?.text ?? params?.contentChanges?.[0]?.text ?? ""
+    appendFileSync(process.env.FAKE_LOG, JSON.stringify({ method, uri, version: params?.textDocument?.version, id: params?.id, outside: text.includes("OUTSIDE"), text: params?.text }) + "\n")
   }
   switch (method) {
     case "initialize": {
       const result = { capabilities: {
-        textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
+        textDocumentSync: process.env.FAKE_SYNC ? JSON.parse(process.env.FAKE_SYNC) : { openClose: true, change: 1, save: { includeText: false } },
         hoverProvider: true, definitionProvider: true, referencesProvider: true, documentSymbolProvider: true,
         workspaceSymbolProvider: true, callHierarchyProvider: true,
         ...(pull ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
       } }
-      if (!process.env.FAKE_EARLY) return send({ id, result })
+      if (!process.env.FAKE_EARLY) return process.env.FAKE_INIT_DELAY ? setTimeout(() => send({ id, result }), Number(process.env.FAKE_INIT_DELAY)) : send({ id, result })
       // An unversioned report from before the file was sent, then a slow start.
       send({ method: "textDocument/publishDiagnostics", params: { uri: new URL(process.env.FAKE_EARLY, params.rootUri + "/").href, diagnostics: diagnose("ERROR stale") } })
       return setTimeout(() => send({ id, result }), 200)
@@ -81,8 +85,10 @@ const handle = (message) => {
       const result = { kind: "full", items: diagnose(text) }
       return text.includes("SLOWPULL") ? setTimeout(() => send({ id, result }), 300) : send({ id, result })
     }
-    case "textDocument/hover":
-      return send({ id, result: { contents: { kind: "markdown", value: "hover " + params.position.line + ":" + params.position.character } } })
+    case "textDocument/hover": {
+      const reply = () => send({ id, result: { contents: { kind: "markdown", value: "hover " + params.position.line + ":" + params.position.character } } })
+      return process.env.FAKE_HOVER_DELAY ? setTimeout(reply, Number(process.env.FAKE_HOVER_DELAY)) : reply()
+    }
     case "textDocument/definition":
       return send({ id, result: [{ targetUri: uri, targetRange: at(uri, 4, 2).range, targetSelectionRange: at(uri, 5, 3).range }] })
     case "textDocument/references":
@@ -172,6 +178,16 @@ const completed = (tool, input, result) => ({ tool, input, status: "completed", 
 
 const FAKE = { fake: { command: ["FAKE"], extensions: [".ts"] } }
 
+async function waitForLog(log, method) {
+  for (const deadline = Date.now() + 5_000; Date.now() < deadline; ) {
+    const entries = (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(JSON.parse)
+    const found = entries.find((entry) => entry.method === method)
+    if (found) return found
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`Server did not log ${method}`)
+}
+
 test("write results get OpenCode 1's error block and TUI metadata; warnings and clean files add nothing", async () => {
   const root = await project(structuredClone(FAKE))
   const { after, cleanup } = await start(root)
@@ -203,6 +219,7 @@ test("patch reports each changed file by path, skips deletions and non-file URIs
   try {
     await mkdir(join(root, "src"))
     await writeFile(join(root, "src", "b.ts"), "ERROR one\nBREAK_OTHER\n")
+    await writeFile(join(root, "src", "other.ts"), "fine\n")
     await writeFile(join(root, "notes.md"), "ERROR not checked\n")
     const event = completed("patch", { patchText: "..." }, {
       output: {
@@ -307,7 +324,7 @@ test("hooks never send files outside the project, keep versions in order, and cl
     const tail = (await sent()).filter((entry) => entry.uri === uri).slice(-3).map((entry) => `${entry.method} ${entry.version ?? ""}`.trim())
     const reopened = versions.at(-1) + 1
     assert.deepEqual(tail, ["textDocument/didClose", `textDocument/didOpen ${reopened}`, "textDocument/didSave"], "a recreated file continues the version count")
-    assert.ok((await sent()).every((entry) => !entry.uri.includes("secret") && !entry.uri.includes("linked")), "outside files must never reach a server")
+    assert.ok((await sent()).every((entry) => !entry.uri?.includes("secret") && !entry.uri?.includes("linked")), "outside files must never reach a server")
   } finally {
     await cleanup()
     await rm(root, { recursive: true, force: true })
@@ -340,7 +357,7 @@ test("a symlink swapped to an outside file mid-check never sends its contents", 
       await after(completed("edit", { path: "swap.ts" }, { content: "Edited swap.ts" }))
     }
     const sent = (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-    assert.ok(sent.some((entry) => entry.uri.endsWith("/swap.ts")), "the inside target should still be synced")
+    assert.ok(sent.some((entry) => entry.uri?.endsWith("/swap.ts")), "the inside target should still be synced")
     assert.ok(sent.every((entry) => !entry.outside), "outside contents must never reach a server")
   } finally {
     const exited = once(swapper, "exit")
@@ -583,6 +600,256 @@ test("setup registers nothing without servers and cleans up what it registered",
     assert.deepEqual(disposed.sort(), ["execute.after", "tools"])
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("other-file diagnostics exclude outside paths and symlinks but keep inside files", async () => {
+  const root = await project(structuredClone(FAKE))
+  const outside = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-outside-")))
+  let cleanup
+  try {
+    await writeFile(join(outside, "secret.ts"), "secret\n")
+    await symlink(join(outside, "secret.ts"), join(root, "linked.ts"))
+    await writeFile(join(root, "other.ts"), "fine\n")
+    const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+    config.lsp.fake.env = { FAKE_OTHER_URIS: JSON.stringify([
+      pathToFileURL(join(outside, "secret.ts")).href,
+      pathToFileURL(join(root, "linked.ts")).href,
+      pathToFileURL(join(root, "missing.ts")).href,
+    ]) }
+    await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+    const started = await start(root)
+    cleanup = started.cleanup
+    await writeFile(join(root, "a.ts"), "BREAK_OTHER\n")
+    const event = completed("edit", { path: "a.ts" }, { content: "Edited a.ts" })
+    await started.after(event)
+    assert.match(event.result.content, /other\.ts/)
+    assert.doesNotMatch(event.result.content, /secret\.ts|linked\.ts|missing\.ts|ERROR outside/)
+  } finally {
+    await cleanup?.()
+    await rm(root, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test("didSave respects disabled, omitted, numeric, boolean, and object capabilities", async () => {
+  for (const [sync, sendsSave, includesText] of [
+    [{ openClose: true, change: 1, save: false }, false, false],
+    [{ openClose: true, change: 1 }, false, false],
+    [1, false, false],
+    [2, false, false],
+    [{ openClose: true, change: 1, save: true }, true, false],
+    [{ openClose: true, change: 1, save: {} }, true, false],
+    [{ openClose: true, change: 1, save: { includeText: true } }, true, true],
+  ]) {
+    const root = await project(structuredClone(FAKE))
+    const log = join(root, "server.log")
+    const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+    config.lsp.fake.env = { FAKE_SYNC: JSON.stringify(sync), FAKE_LOG: log }
+    await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+    const { after, cleanup } = await start(root)
+    try {
+      await writeFile(join(root, "a.ts"), "ERROR here\n")
+      await after(completed("edit", { path: "a.ts" }, { content: "Edited a.ts" }))
+      const saved = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.method === "textDocument/didSave")
+      assert.equal(saved.length, sendsSave ? 1 : 0, JSON.stringify(sync))
+      if (sendsSave) assert.equal(saved[0].text, includesText ? "ERROR here\n" : undefined)
+    } finally {
+      await cleanup()
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test("already-aborted navigation does not start a server", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "fine\n")
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, { signal: controller.signal }), { name: "AbortError" })
+    await assert.rejects(readFile(log), { code: "ENOENT" })
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("already-aborted sync returns a rejected promise without starting a server", async () => {
+  const root = await project(structuredClone(FAKE))
+  const settings = resolveSettings(root, {}, { OPENCODE_CONFIG_DIR: join(root, "no-global") })
+  const manager = new LspManager(settings, root)
+  try {
+    const controller = new AbortController()
+    const reason = new Error("cancelled before sync")
+    controller.abort(reason)
+    const pending = manager.sync(join(root, "a.ts"), controller.signal)
+    assert.ok(pending instanceof Promise)
+    await assert.rejects(pending, (error) => error === reason)
+  } finally {
+    await manager.shutdown()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("cancelling an in-flight request sends cancelRequest and keeps the server usable", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log, FAKE_HOVER_DELAY: "2000" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "fine\n")
+    const controller = new AbortController()
+    const pending = lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, { signal: controller.signal })
+    const rejected = assert.rejects(pending, { name: "AbortError" })
+    await waitForLog(log, "textDocument/hover")
+    const began = Date.now()
+    controller.abort()
+    await rejected
+    assert.ok(Date.now() - began < 1_000, "cancellation must not wait for the server's reply")
+    const cancel = await waitForLog(log, "$/cancelRequest")
+    assert.equal(typeof cancel.id, "number")
+    const symbols = await lsp.execute({ operation: "documentSymbol", path: "a.ts" }, {})
+    assert.match(symbols.content, /Outer/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("cancelling cold navigation interrupts push and pull diagnostic waits", async () => {
+  for (const pull of [false, true]) {
+    const root = await project(structuredClone(FAKE))
+    const log = join(root, "server.log")
+    const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+    config.lsp.fake.env = { FAKE_LOG: log, ...(pull ? { FAKE_PULL: "1" } : {}) }
+    await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+    const { lsp, cleanup } = await start(root)
+    try {
+      await writeFile(join(root, "a.ts"), pull ? "ERROR SLOWPULL\n" : "SILENT\n")
+      const controller = new AbortController()
+      const pending = lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, { signal: controller.signal })
+      const rejected = assert.rejects(pending, { name: "AbortError" })
+      await waitForLog(log, pull ? "textDocument/diagnostic" : "textDocument/didOpen")
+      const began = Date.now()
+      controller.abort()
+      await rejected
+      assert.ok(Date.now() - began < 1_000, "cancellation must not wait for diagnostic warm-up")
+      if (pull) await waitForLog(log, "$/cancelRequest")
+      await writeFile(join(root, "a.ts"), "fine\n")
+      assert.match((await lsp.execute({ operation: "documentSymbol", path: "a.ts" }, {})).content, /Outer/)
+    } finally {
+      await cleanup()
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test("cancelling startup does not break another caller's shared server", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log, FAKE_INIT_DELAY: "500" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "fine\n")
+    await writeFile(join(root, "b.ts"), "fine\n")
+    const controller = new AbortController()
+    const pending = lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, { signal: controller.signal })
+    const rejected = assert.rejects(pending, { name: "AbortError" })
+    await waitForLog(log, "initialize")
+    controller.abort()
+    await rejected
+    assert.match((await lsp.execute({ operation: "documentSymbol", path: "b.ts" }, {})).content, /Outer/)
+    const sent = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse)
+    assert.equal(sent.filter((entry) => entry.method === "initialize").length, 1)
+    assert.ok(!sent.some((entry) => entry.uri === pathToFileURL(join(root, "a.ts")).href))
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("cancelled multi-server startup keeps prior diagnostic versions valid", async () => {
+  const root = await project({
+    first: { command: ["FAKE"], extensions: [".ts"] },
+    second: { command: ["FAKE"], extensions: [".alt"] },
+  })
+  const firstLog = join(root, "first.log")
+  const secondLog = join(root, "second.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.first.env = { FAKE_LOG: firstLog }
+  config.lsp.second.env = { FAKE_LOG: secondLog, FAKE_INIT_DELAY: "500" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const settings = resolveSettings(root, {}, { OPENCODE_CONFIG_DIR: join(root, "no-global") })
+  const manager = new LspManager(settings, root)
+  try {
+    const file = join(root, "a.ts")
+    await writeFile(file, "ERROR DELAYED\n")
+    const pendingDiagnostics = manager.diagnostics(file, 1_200)
+    await waitForLog(firstLog, "textDocument/didOpen")
+    // Make a second, cold server applicable while the first's report is in flight.
+    settings.servers.find((server) => server.id === "second").extensions.push(".ts")
+    const controller = new AbortController()
+    const rejected = assert.rejects(manager.sync(file, controller.signal), { name: "AbortError" })
+    await waitForLog(secondLog, "initialize")
+    controller.abort()
+    await rejected
+    const report = await pendingDiagnostics
+    assert.equal(report.file?.length, 1, "a cancelled sync must not invalidate the first server's pending report")
+    const firstSent = (await readFile(firstLog, "utf8")).trim().split("\n").map(JSON.parse)
+    assert.equal(firstSent.filter((entry) => entry.method === "textDocument/didChange").length, 0)
+    const synced = await manager.sync(file)
+    assert.ok(synced.every(({ version }) => version === 2), "a cancelled sync must not consume a version")
+  } finally {
+    await manager.shutdown()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("aborting after a completed request does not send a cancellation", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "fine\n")
+    const controller = new AbortController()
+    assert.equal((await lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, { signal: controller.signal })).content, "hover 0:0")
+    controller.abort()
+    await lsp.execute({ operation: "documentSymbol", path: "a.ts" }, {})
+    const sent = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse)
+    assert.ok(!sent.some((entry) => entry.method === "$/cancelRequest"))
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("cancellation stops transient-error retry delays", async () => {
+  const controller = new AbortController()
+  const reason = new Error("custom cancellation reason")
+  let attempts = 0
+  const client = { request: async () => {
+    attempts++
+    throw new LspError("still loading", -32802)
+  } }
+  const timer = setTimeout(() => controller.abort(reason), 50)
+  try {
+    await assert.rejects(requestWithRetry(client, "textDocument/hover", {}, controller.signal), (error) => error === reason)
+    assert.equal(attempts, 1)
+  } finally {
+    clearTimeout(timer)
   }
 })
 
