@@ -1,0 +1,31 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Replace this with the absolute path to your clone. Keep your other plugins.
+  "plugins": ["/absolute/path/to/opencode-v2-lsp-support"],
+  "lsp": {
+    "pyright": {
+      "command": ["pyright-langserver", "--stdio"],
+      "extensions": [".py", ".pyi"]
+    },
+    "typescript": {
+      "command": ["typescript-language-server", "--stdio"],
+      "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+    },
+    "gopls": {
+      "command": ["gopls", "serve"],
+      "extensions": [".go"]
+    },
+    "bash": {
+      "command": ["bash-language-server", "start"],
+      "extensions": [".sh", ".bash"]
+    },
+    "yaml-ls": {
+      "command": ["yaml-language-server", "--stdio"],
+      "extensions": [".yaml", ".yml"]
+    },
+    "rust": {
+      "command": ["rust-analyzer"],
+      "extensions": [".rs"]
+    }
+  }
+}
