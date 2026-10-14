@@ -1,2 +1,5 @@
 node_modules/
 .worktrees/
+
+# Written by the PowerShell language server in the project root on session start
+PowerShellEditorServices.json
