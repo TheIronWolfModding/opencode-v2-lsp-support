@@ -51,6 +51,16 @@ export interface ClientOptions {
 }
 
 /** A JSON-RPC 2.0 client for one language server over stdio. */
+/** A `client/registerCapability` entry for pull diagnostics, as OpenCode 1 tracked them. */
+interface PullRegistration {
+  readonly id: string
+  readonly method: string
+  readonly registerOptions?: {
+    readonly identifier?: string[]
+    readonly workspaceDiagnostics?: boolean
+  }
+}
+
 export class LspClient {
   readonly id: string
   readonly #options: ClientOptions
@@ -59,6 +69,7 @@ export class LspClient {
   #nextId = 1
   #pending = new Map<number, Pending>()
   #capabilities: Record<string, any> = {}
+  #pullRegistrations = new Map<string, PullRegistration>()
   #stopping = false
 
   constructor(options: ClientOptions) {
@@ -68,6 +79,20 @@ export class LspClient {
 
   get capabilities(): Record<string, any> {
     return this.#capabilities
+  }
+
+  /**
+   * Pull-diagnostic state as OpenCode 1 computed it: the static `diagnosticProvider`
+   * capability plus `client/registerCapability` entries for `textDocument/diagnostic`
+   * (excluding workspace-scoped ones, which answer `workspace/diagnostic` instead).
+   */
+  get documentPullState(): { supported: boolean; identifiers: string[] } {
+    const registrations = [...this.#pullRegistrations.values()]
+    const documentRegistrations = registrations.filter((registration) => registration.registerOptions?.workspaceDiagnostics !== true)
+    return {
+      supported: Boolean(this.#capabilities.diagnosticProvider) || documentRegistrations.length > 0,
+      identifiers: [...new Set(documentRegistrations.flatMap((registration) => registration.registerOptions?.identifier ?? []))],
+    }
   }
 
   get running(): boolean {
@@ -106,11 +131,14 @@ export class LspClient {
         capabilities: {
           general: { positionEncodings: ["utf-16"] },
           window: { workDoneProgress: true },
-          workspace: { configuration: true, workspaceFolders: true, symbol: {} },
+          workspace: { configuration: true, workspaceFolders: true, symbol: {}, didChangeWatchedFiles: { dynamicRegistration: true } },
           textDocument: {
-            synchronization: { dynamicRegistration: false, didSave: true },
+            // OpenCode 1 declared didOpen/didChange; didSave is this port's addition (v1 never sent it).
+            synchronization: { didOpen: true, didChange: true, didSave: true },
             publishDiagnostics: { versionSupport: true },
-            diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
+            // OpenCode 1 asked for dynamic pull registration and related documents; servers
+            // like eclipse.jdt.ls only offer pull diagnostics through a registration.
+            diagnostic: { dynamicRegistration: true, relatedDocumentSupport: true },
             hover: { contentFormat: ["markdown", "plaintext"] },
             definition: { linkSupport: true },
             implementation: { linkSupport: true },
@@ -172,13 +200,14 @@ export class LspClient {
     if (child && child.exitCode === null) {
       await this.request("shutdown", null, 2_000).catch(() => undefined)
       this.#send({ jsonrpc: "2.0", method: "exit" })
+      // OpenCode 1 only ever sent SIGTERM (via Process.stop); this port escalates
+      // SIGTERM -> SIGKILL only if the server ignores the LSP exit notification.
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL")
-          resolve()
-        }, 1_000)
+        const terminate = setTimeout(() => child.kill("SIGTERM"), 500)
+        const kill = setTimeout(() => child.kill("SIGKILL"), 1_000)
         child.once("exit", () => {
-          clearTimeout(timer)
+          clearTimeout(terminate)
+          clearTimeout(kill)
           resolve()
         })
       })
@@ -205,15 +234,20 @@ export class LspClient {
   #onData(chunk: Buffer): void {
     this.#buffer = Buffer.concat([this.#buffer, chunk])
     while (true) {
-      const separator = this.#buffer.indexOf("\r\n\r\n")
+      // The LSP base protocol mandates CRLF, but the vscode-jsonrpc reader OpenCode 1
+      // used also accepted LF-only header lines, so accept both header separators.
+      const crlf = this.#buffer.indexOf("\r\n\r\n")
+      const lf = this.#buffer.indexOf("\n\n")
+      const separator = crlf >= 0 && (lf < 0 || crlf <= lf) ? crlf : lf
       if (separator < 0) return
+      const boundary = separator === crlf ? 4 : 2
       const header = this.#buffer.subarray(0, separator).toString("utf8")
       const match = /Content-Length:\s*(\d+)/i.exec(header)
       if (!match) {
-        this.#buffer = this.#buffer.subarray(separator + 4)
+        this.#buffer = this.#buffer.subarray(separator + boundary)
         continue
       }
-      const start = separator + 4
+      const start = separator + boundary
       const end = start + Number(match[1])
       if (this.#buffer.length < end) return
       const body = this.#buffer.subarray(start, end).toString("utf8")
@@ -261,10 +295,28 @@ export class LspClient {
       case "workspace/workspaceFolders":
         reply([{ uri: this.#options.rootUri, name: "workspace" }])
         return
-      case "client/registerCapability":
-      case "client/unregisterCapability":
+      case "client/registerCapability": {
+        // Keep pull-diagnostic registrations so diagnostics waits can use them, as OpenCode 1 did.
+        for (const registration of Array.isArray(params?.registrations) ? params.registrations : []) {
+          if (registration?.method === "textDocument/diagnostic" && typeof registration?.id === "string") {
+            this.#pullRegistrations.set(registration.id, registration)
+          }
+        }
+        reply(null)
+        return
+      }
+      case "client/unregisterCapability": {
+        for (const registration of Array.isArray(params?.unregisterations) ? params.unregisterations : []) {
+          if (registration?.method === "textDocument/diagnostic" && typeof registration?.id === "string") {
+            this.#pullRegistrations.delete(registration.id)
+          }
+        }
+        reply(null)
+        return
+      }
       case "window/workDoneProgress/create":
       case "window/showMessageRequest":
+      case "workspace/diagnostic/refresh":
         reply(null)
         return
       default:
@@ -274,8 +326,9 @@ export class LspClient {
 
   /** Answers `workspace/configuration` from the server's `initialization` options. */
   #section(section: unknown): unknown {
-    const settings = this.#options.initialization ?? {}
-    if (typeof section !== "string" || section === "") return settings
+    // v1's configurationValue: with no initialization the answer is null, not {}.
+    const settings = this.#options.initialization
+    if (typeof section !== "string" || section === "") return settings ?? null
     let value: any = settings
     for (const key of section.split(".")) {
       value = value?.[key]
@@ -294,4 +347,17 @@ export class LspClient {
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** The server's document sync kind from its capabilities, as OpenCode 1 read it: numeric or `{ change }`. */
+export function syncKindOf(capabilities: Record<string, any>): number | undefined {
+  const sync = capabilities.textDocumentSync
+  if (typeof sync === "number") return sync
+  return typeof sync?.change === "number" ? sync.change : undefined
+}
+
+/** The position just past the last character of `text`, used to replace the whole document incrementally. */
+export function endPosition(text: string): Position {
+  const lines = text.split(/\r\n|\r|\n/)
+  return { line: lines.length - 1, character: lines.at(-1)?.length ?? 0 }
 }

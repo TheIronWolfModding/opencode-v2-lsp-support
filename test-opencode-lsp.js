@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 // Usage: test-opencode-lsp.js [plugin-dir]
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { constants } from "node:fs"
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { homedir, tmpdir } from "node:os"
+import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const PLUGIN = pathToFileURL(resolve(process.argv[2] ?? new URL(".", import.meta.url).pathname) + "/")
 const { default: plugin } = await import(new URL("index.ts", PLUGIN))
 const { resolveSettings } = await import(new URL("src/config.ts", PLUGIN))
 const { LspManager, serverRoot, requestWithRetry } = await import(new URL("src/manager.ts", PLUGIN))
+const { ensureServer } = await import(new URL("src/download.ts", PLUGIN))
 const { LspError } = await import(new URL("src/client.ts", PLUGIN))
 
 const cases = []
@@ -22,12 +24,14 @@ const test = (name, run) => cases.push({ name, run })
 const FAKE_SERVER = String.raw`
 import { appendFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-const pull = process.env.FAKE_PULL === "1"
+const pull = process.env.FAKE_PULL === "1" || process.env.FAKE_REG === "1"
 const documents = new Map()
 let buffer = Buffer.alloc(0)
 const send = (message) => {
   const body = JSON.stringify({ jsonrpc: "2.0", ...message })
-  process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\r\n\r\n" + body)
+  // LF-only header endings, like the vscode-jsonrpc readers tolerate.
+  const boundary = process.env.FAKE_LF ? "\n\n" : "\r\n\r\n"
+  process.stdout.write("Content-Length: " + Buffer.byteLength(body) + boundary + body)
 }
 const diagnose = (text) =>
   text.split("\n").flatMap((line, index) => {
@@ -59,9 +63,13 @@ const item = (name, uri, line) => ({ name, kind: 12, uri, range: at(uri, line, 0
 const handle = (message) => {
   const { id, method, params } = message
   const uri = params?.textDocument?.uri
-  if (process.env.FAKE_LOG && (method?.startsWith("textDocument/") || method === "$/cancelRequest" || method === "initialize")) {
+  // A co-serving server that errors on every navigation request, like a biome that
+  // chokes on a file while the healthy file server answers.
+  if (process.env.FAKE_FAIL_NAV && id !== undefined && method?.startsWith("textDocument/"))
+    return send({ id, error: { code: -32603, message: "nav down" } })
+  if (process.env.FAKE_LOG && (method?.startsWith("textDocument/") || method === "$/cancelRequest" || method === "initialize" || method === "workspace/didChangeWatchedFiles")) {
     const text = params?.textDocument?.text ?? params?.contentChanges?.[0]?.text ?? ""
-    appendFileSync(process.env.FAKE_LOG, JSON.stringify({ method, uri, version: params?.textDocument?.version, id: params?.id, outside: text.includes("OUTSIDE"), text: params?.text }) + "\n")
+    appendFileSync(process.env.FAKE_LOG, JSON.stringify({ method, uri, version: params?.textDocument?.version, id: params?.id, outside: text.includes("OUTSIDE"), text: params?.text, initializationOptions: params?.initializationOptions, watchTypes: Array.isArray(params?.changes) ? params.changes.map((change) => change.type) : undefined, changeRange: params?.contentChanges?.[0]?.range, identifier: params?.identifier }) + "\n")
   }
   switch (method) {
     case "initialize": {
@@ -69,9 +77,18 @@ const handle = (message) => {
         textDocumentSync: process.env.FAKE_SYNC ? JSON.parse(process.env.FAKE_SYNC) : { openClose: true, change: 1, save: { includeText: false } },
         hoverProvider: true, definitionProvider: true, referencesProvider: true, documentSymbolProvider: true,
         workspaceSymbolProvider: true, callHierarchyProvider: true,
-        ...(pull ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
+        ...(process.env.FAKE_PULL === "1" ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
       } }
-      if (!process.env.FAKE_EARLY) return process.env.FAKE_INIT_DELAY ? setTimeout(() => send({ id, result }), Number(process.env.FAKE_INIT_DELAY)) : send({ id, result })
+      // A jdtls-style server only offers pull diagnostics through a dynamic registration.
+      if (process.env.FAKE_REG) send({ id: 900, method: "client/registerCapability", params: { registrations: [{ id: "pull-extra", method: "textDocument/diagnostic", registerOptions: { identifier: ["registered"] } }] } })
+      if (!process.env.FAKE_EARLY) {
+        const replyInit = () => {
+          send({ id, result })
+          // A server polling its configuration right after initialize, like lua-ls and pylsp do.
+          if (process.env.FAKE_CONFIG) send({ id: 901, method: "workspace/configuration", params: { items: [{}, { section: "python" }, { section: "python.pythonPath" }, { section: "missing.deep" }] } })
+        }
+        return process.env.FAKE_INIT_DELAY ? setTimeout(replyInit, Number(process.env.FAKE_INIT_DELAY)) : replyInit()
+      }
       // An unversioned report from before the file was sent, then a slow start.
       send({ method: "textDocument/publishDiagnostics", params: { uri: new URL(process.env.FAKE_EARLY, params.rootUri + "/").href, diagnostics: diagnose("ERROR stale") } })
       return setTimeout(() => send({ id, result }), 200)
@@ -82,7 +99,9 @@ const handle = (message) => {
       return changed(uri, params.textDocument.version, params.contentChanges[0].text)
     case "textDocument/diagnostic": {
       const text = documents.get(uri) ?? ""
-      const result = { kind: "full", items: diagnose(text) }
+      const result = params?.identifier === "registered" && process.env.FAKE_REG
+        ? { kind: "full", items: diagnose("ERROR registered") }
+        : { kind: "full", items: diagnose(text) }
       return text.includes("SLOWPULL") ? setTimeout(() => send({ id, result }), 300) : send({ id, result })
     }
     case "textDocument/hover": {
@@ -98,6 +117,13 @@ const handle = (message) => {
         children: [{ name: "inner", detail: "(): void", kind: 6, range: at(uri, 1, 2).range, selectionRange: at(uri, 1, 2).range }] }] })
     case "workspace/symbol": {
       const location = at(new URL("lib/x.ts", "file://" + process.cwd() + "/").href, 9, 0)
+      if (params.query === "kinds")
+        return send({ id, result: [
+          { name: "FileThing", kind: 1, location },
+          { name: "Container", kind: 4, location },
+          { name: "Cls", kind: 5, location },
+          { name: "fn", kind: 12, location },
+        ] })
       const count = params.query === "many" ? 25 : 1
       return send({ id, result: Array.from({ length: count }, (_, n) => ({ name: "Thing" + params.query + (n || ""), kind: 13, containerName: "mod", location })) })
     }
@@ -113,7 +139,11 @@ const handle = (message) => {
     case "exit":
       return process.exit(0)
     default:
-      if (id !== undefined) send({ id, result: null })
+      // Record how the client answered our configuration poll (a response carries no method).
+      if (id === 901 && method === undefined && process.env.FAKE_LOG)
+        appendFileSync(process.env.FAKE_LOG, JSON.stringify({ method: "configuration-reply", config: message.result }) + "\n")
+      // Only answer requests; a response to one of our own requests has no method.
+      if (id !== undefined && method) send({ id, result: null })
   }
 }
 process.stdin.on("data", (chunk) => {
@@ -145,9 +175,20 @@ async function start(root, options = {}) {
   const tools = []
   const hooks = []
   const disposed = []
+  const emitted = []
+  let status
   const ctx = {
     location: { directory: root },
     options,
+    rpc: {
+      register: async (definition, handlers) => {
+        status = handlers.status
+        return {
+          events: { emit: (name, data) => emitted.push({ name, data }) },
+          dispose: async () => disposed.push("rpc"),
+        }
+      },
+    },
     tool: {
       transform: async (callback) => {
         callback({ add: (tool) => tools.push(tool) })
@@ -163,6 +204,7 @@ async function start(root, options = {}) {
   process.env.OPENCODE_CONFIG_DIR = join(root, "no-global")
   delete process.env.OPENCODE_CONFIG
   delete process.env.OPENCODE_CONFIG_CONTENT
+  process.env.PATH = join(root, "empty-path")
   let cleanup
   try {
     cleanup = await plugin.setup(ctx)
@@ -171,7 +213,7 @@ async function start(root, options = {}) {
   }
   const lsp = tools.find((tool) => tool.name === "lsp")
   const after = hooks.find((hook) => hook.name === "execute.after")?.callback
-  return { tools, hooks, disposed, cleanup, lsp, after }
+  return { tools, hooks, disposed, cleanup, lsp, after, emitted, status }
 }
 
 const completed = (tool, input, result) => ({ tool, input, status: "completed", sessionID: "s", agent: "a", messageID: "m", id: "c", result })
@@ -586,9 +628,10 @@ test("a server that cannot start leaves edits alone and makes the tool explain w
 test("setup registers nothing without servers and cleans up what it registered", async () => {
   const empty = await project({ off: { disabled: true } })
   try {
-    const { tools, hooks, cleanup } = await start(empty)
+    const { tools, hooks, disposed, cleanup } = await start(empty)
     assert.equal(tools.length + hooks.length, 0)
-    assert.equal(cleanup, undefined)
+    await cleanup()
+    assert.deepEqual(disposed, ["rpc"])
   } finally {
     await rm(empty, { recursive: true, force: true })
   }
@@ -597,7 +640,24 @@ test("setup registers nothing without servers and cleans up what it registered",
   try {
     const { disposed, cleanup } = await start(root)
     await cleanup()
-    assert.deepEqual(disposed.sort(), ["execute.after", "tools"])
+    assert.deepEqual(disposed.sort(), ["execute.after", "rpc", "tools"])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("status and lifecycle events drive the terminal sidebar rows", async () => {
+  const root = await project(structuredClone(FAKE))
+  try {
+    const { after, cleanup, emitted, status } = await start(root)
+    assert.deepEqual(await status(), { configured: true, servers: [] })
+    await writeFile(join(root, "a.ts"), "ok\n")
+    const event = completed("write", { path: "a.ts" }, { content: "Edited a.ts" })
+    await after(event)
+    assert.ok(emitted.some((entry) => entry.name === "connected" && entry.data.id === "fake" && entry.data.root === root))
+    assert.deepEqual(await status(), { configured: true, servers: [{ id: "fake", root, status: "connected" }] })
+    await cleanup()
+    assert.ok(emitted.some((entry) => entry.name === "shutdown" && entry.data.id === "fake"))
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -658,6 +718,170 @@ test("didSave respects disabled, omitted, numeric, boolean, and object capabilit
       await cleanup()
       await rm(root, { recursive: true, force: true })
     }
+  }
+})
+
+test("OpenCode 1's watched-files announcement precedes document notifications, and incremental servers get whole-document range replacements", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_SYNC: JSON.stringify({ openClose: true, change: 2, save: false }), FAKE_LOG: log }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { after, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "one\nERROR two\n")
+    await after(completed("edit", { path: "a.ts" }, { content: "Edited a.ts" }))
+    await writeFile(join(root, "a.ts"), "one\nERROR two\nthree\n")
+    await after(completed("edit", { path: "a.ts" }, { content: "Edited a.ts" }))
+    const entries = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.method !== "initialize")
+    assert.deepEqual(
+      entries.map((entry) => entry.method),
+      ["workspace/didChangeWatchedFiles", "textDocument/didOpen", "workspace/didChangeWatchedFiles", "textDocument/didChange"],
+      "the watched-files event must precede each document notification",
+    )
+    assert.deepEqual(entries[0].watchTypes, [1], "the first announcement is Created")
+    assert.deepEqual(entries[2].watchTypes, [2], "the second announcement is Changed")
+    assert.deepEqual(entries[3].changeRange, { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } }, "the incremental change must replace the text the server holds")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("dynamically registered pull diagnostics are requested with the registered identifier", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_REG: "1", FAKE_LOG: log }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { after, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "d.ts"), "fine\n")
+    const event = completed("edit", { path: "d.ts" }, { content: "Edited d.ts" })
+    const started = Date.now()
+    await after(event)
+    assert.match(event.result.content, /ERROR \[1:1\] bad 0/, "the registered identifier's report must reach the edit result")
+    assert.ok(Date.now() - started < 2_000, "the registered pull must answer, not the push timeout")
+    const pulls = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.method === "textDocument/diagnostic")
+    assert.ok(pulls.some((entry) => entry.identifier === "registered"), "the registered identifier must be pulled alongside the base provider")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("workspace/configuration answers from the initialization options, v1's configurationValue semantics", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log, FAKE_CONFIG: "1" }
+  config.lsp.fake.initialization = { python: { pythonPath: "/venv/bin/python" } }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "c.ts"), "ok\n")
+    await lsp.execute({ operation: "hover", path: "c.ts", line: 1, character: 1 }, {})
+    const entry = await waitForLog(log, "configuration-reply")
+    assert.deepEqual(entry.config, [
+      { python: { pythonPath: "/venv/bin/python" } },
+      { pythonPath: "/venv/bin/python" },
+      "/venv/bin/python",
+      null,
+    ], "no section returns the whole options, sections walk them, and a missing path answers null")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("workspace/configuration answers null everywhere when the server has no initialization options", async () => {
+  const root = await project(structuredClone(FAKE))
+  const log = join(root, "server.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LOG: log, FAKE_CONFIG: "1" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "c.ts"), "ok\n")
+    await lsp.execute({ operation: "hover", path: "c.ts", line: 1, character: 1 }, {})
+    const entry = await waitForLog(log, "configuration-reply")
+    assert.deepEqual(entry.config, [null, null, null, null], "v1's configurationValue(undefined, section) is always null")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("navigation keeps the healthy server's answers when a co-serving server errors", async () => {
+  // OpenCode 1 caught each client's failure separately, so one broken server among
+  // several for the same file must not sink the request.
+  const root = await project(structuredClone(FAKE))
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.failing = { command: ["FAKE"], extensions: [".ts"], env: { FAKE_FAIL_NAV: "1" } }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ok\n")
+    const hover = await lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, {})
+    assert.match(hover.content, /hover 0:0/, "the healthy server's hover must survive the failing one")
+    const definition = await lsp.execute({ operation: "goToDefinition", path: "a.ts", line: 1, character: 1 }, {})
+    assert.match(definition.content, /a\.ts:6:4/, "the healthy server's definition must survive the failing one")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("navigation explains the failure when every server for the file errors", async () => {
+  const root = await project(structuredClone(FAKE))
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_FAIL_NAV: "1" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ok\n")
+    await assert.rejects(
+      lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, {}),
+      /nav down/,
+      "a total failure must still be explained, not swallowed like OpenCode 1 swallowed it",
+    )
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("messages framed with LF-only header endings are parsed like CRLF ones", async () => {
+  const root = await project(structuredClone(FAKE))
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env = { FAKE_LF: "1" }
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const { lsp, after, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ERROR broken\n")
+    const event = completed("edit", { path: "a.ts" }, { content: "Edited a.ts" })
+    await after(event)
+    assert.match(event.result.content, /ERROR \[1:1\] bad 0/, "diagnostic pushes over LF-framed messages must arrive")
+    const hover = await lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, {})
+    assert.match(hover.content, /hover 0:0/, "responses over LF-framed messages must arrive")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("workspaceSymbol keeps OpenCode 1's meaningful kinds and drops file/package noise", async () => {
+  const root = await project(structuredClone(FAKE))
+  const { lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ok\n")
+    const result = await lsp.execute({ operation: "workspaceSymbol", path: "a.ts", query: "kinds" }, {})
+    assert.match(result.content, /Cls \(class\) lib\/x\.ts:10:1/)
+    assert.match(result.content, /fn \(function\) lib\/x\.ts:10:1/)
+    assert.doesNotMatch(result.content, /FileThing|Container/, "file and package kinds must be filtered like OpenCode 1 filtered them")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
   }
 })
 
@@ -875,6 +1099,8 @@ test("settings follow OpenCode 2's config precedence and deep merge, then plugin
       settings.servers.map(({ id, command, extensions }) => ({ id, command, extensions })),
       [
         { id: "gopls", command: ['/opt/go"pls', "serve"], extensions: [".go"] },
+        // OpenCode 1 kept a configured custom ID with no extensions and applied it to every file.
+        { id: "custom", command: ["custom-ls"], extensions: [] },
         { id: "yaml", command: ["yaml-language-server"], extensions: [".yml", ".yaml"] },
       ],
     )
@@ -888,6 +1114,265 @@ test("settings follow OpenCode 2's config precedence and deep merge, then plugin
     )
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("auto-discovery enables installed built-ins implicitly; declared `lsp` IDs (even disabled) own themselves", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-discover-")))
+  try {
+    const bin = join(root, "bin")
+    await mkdir(bin)
+    const installed = ["bash-language-server", "gopls", "pyright-langserver", "texlab", "ty"]
+    for (const name of installed) await writeFile(join(bin, name), "#!/bin/sh\n")
+    for (const name of installed) await chmod(join(bin, name), 0o755)
+    await mkdir(join(root, ".venv", "bin"), { recursive: true })
+    await writeFile(join(root, ".venv", "bin", "python"), "#!/bin/sh\n")
+    await chmod(join(root, ".venv", "bin", "python"), 0o755)
+    await writeFile(join(root, "opencode.json"), JSON.stringify({ lsp: { texlab: { disabled: true }, gopls: { command: ["custom-gopls"] } } }))
+    const env = { PATH: bin, OPENCODE_CONFIG_DIR: join(root, "no-global") }
+    const servers = resolveSettings(root, {}, env).servers
+    assert.deepEqual(
+      servers.map(({ id, command }) => [id, command]),
+      [
+        ["gopls", ["custom-gopls"]],
+        ["pyright", [join(bin, "pyright-langserver"), "--stdio"]],
+        ["bash", [join(bin, "bash-language-server"), "start"]],
+      ],
+    )
+    const pyright = servers.find((server) => server.id === "pyright")
+    assert.deepEqual(pyright.initialization, { pythonPath: join(root, ".venv", "bin", "python") })
+    assert.deepEqual(servers.find((server) => server.id === "bash").extensions, [".sh", ".bash", ".zsh", ".ksh"])
+    assert.deepEqual(
+      resolveSettings(root, { discover: false }, env).servers.map(({ id, command }) => [id, command]),
+      [["gopls", ["custom-gopls"]]],
+    )
+    assert.deepEqual(
+      resolveSettings(root, { experimentalTy: true }, env).servers.map(({ id, command }) => [id, command]),
+      [
+        ["gopls", ["custom-gopls"]],
+        ["ty", [join(bin, "ty"), "server"]],
+        ["bash", [join(bin, "bash-language-server"), "start"]],
+      ],
+    )
+    const bare = await mkdtemp(join(tmpdir(), "opencode-lsp-unset-"))
+    assert.deepEqual(resolveSettings(bare, {}, { PATH: bin, OPENCODE_CONFIG_DIR: join(root, "no-global") }).servers, [])
+    await rm(bare, { recursive: true, force: true })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("download option marks every fetchable built-in as pending without fetching anything", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-download-")))
+  try {
+    await writeFile(join(root, "opencode.json"), JSON.stringify({ lsp: true }))
+    const bin = join(root, "bin")
+    await mkdir(bin)
+    const env = { PATH: bin, OPENCODE_CONFIG_DIR: join(root, "no-global") }
+    const settings = resolveSettings(root, { download: true }, env)
+    assert.equal(settings.binDir, join(homedir(), ".cache", "opencode-lsp-bin"))
+    assert.deepEqual(
+      settings.servers.map(({ id }) => id).sort(),
+      ["astro", "bash", "biome", "csharp", "dockerfile", "fsharp", "gopls", "lua-ls", "php intelephense", "pyright", "svelte", "terraform", "texlab", "typescript", "vue", "yaml-ls", "zls"],
+    )
+    const pyright = settings.servers.find((server) => server.id === "pyright")
+    assert.deepEqual(pyright.command, [])
+    assert.equal(pyright.download, true)
+    assert.deepEqual(pyright.extensions, [".py", ".pyi"])
+    assert.deepEqual(resolveSettings(root, {}, env).servers, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("ensureServer fetches a marked server lazily through its installer and reuses the binary", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-fetch-")))
+  try {
+    const stub = join(root, "stub")
+    await mkdir(stub)
+    await writeFile(join(stub, "npm"),
+      "#!/usr/bin/env node\n" +
+      "const fs = require(\"node:fs\")\n" +
+      "const argv = process.argv.slice(2)\n" +
+      "if (argv[0] !== \"install\" || !argv.includes(\"--ignore-scripts\") || !argv.includes(\"--global\") || !argv.includes(\"--prefix\")) process.exit(1)\n" +
+      "const pkg = argv[1]\n" +
+      "const prefix = argv[argv.indexOf(\"--prefix\") + 1]\n" +
+      "fs.mkdirSync(prefix + \"/bin\", { recursive: true })\n" +
+      "const bin = pkg === \"pyright\" ? \"pyright-langserver\" : pkg\n" +
+      "fs.writeFileSync(prefix + \"/bin/\" + bin, \"#!/bin/sh\\nexit 0\\n\")\n" +
+      "fs.chmodSync(prefix + \"/bin/\" + bin, 0o755)\n")
+    await chmod(join(stub, "npm"), 0o755)
+    const marker = { id: "pyright", command: [], extensions: [".py", ".pyi"], env: {}, download: true }
+    const binDir = join(root, "lsp-bin")
+    const env = { ...process.env, PATH: `${stub}:${dirname(process.execPath)}` }
+    const command = await ensureServer(marker, binDir, env)
+    assert.deepEqual(command, [join(binDir, "pyright", "bin", "pyright-langserver"), "--stdio"])
+    assert.deepEqual(await ensureServer(marker, binDir, env), command)
+    const configured = { id: "custom", command: ["python3", "lsp"], extensions: [".py"], env: {} }
+    assert.deepEqual(await ensureServer(configured, binDir, env), ["python3", "lsp"])
+    let failure
+    try {
+      await ensureServer(marker, join(root, "empty-bin"), { PATH: join(root, "nothing") })
+    } catch (error) {
+      failure = error
+    }
+    assert.ok(failure)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("binDir defaults to the cache directory, expands ~/ to the home directory, and resolves relative values", async () => {
+  const root = await mkdtemp(join(tmpdir(), "opencode-lsp-bindir-"))
+  try {
+    const env = { OPENCODE_CONFIG_DIR: join(root, "no-global") }
+    assert.equal(resolveSettings(root, {}, env).binDir, join(homedir(), ".cache", "opencode-lsp-bin"))
+    assert.equal(resolveSettings(root, { binDir: "" }, env).binDir, join(homedir(), ".cache", "opencode-lsp-bin"))
+    assert.equal(resolveSettings(root, { binDir: "~/lsp-bins" }, env).binDir, join(homedir(), "lsp-bins"))
+    assert.equal(resolveSettings(root, { binDir: "relative-lsp-bins" }, env).binDir, join(process.cwd(), "relative-lsp-bins"))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("the zls tar flow fetches the per-platform asset and unpacks the root-level binary", async () => {
+  if (process.platform !== "linux" || process.arch !== "x64") return
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-zls-")))
+  try {
+    const asset = "zls-x86_64-linux.tar.xz"
+    const payload = join(root, "payload")
+    await mkdir(payload)
+    await writeFile(join(payload, "zls"), "#!/bin/sh\nexit 0\n")
+    await chmod(join(payload, "zls"), 0o755)
+    const archive = join(root, asset)
+    const made = spawnSync("tar", ["-cJf", archive, "-C", payload, "zls"], { stdio: "pipe" })
+    assert.equal(made.status, 0, "GNU tar with xz support is required for this case")
+    const bytes = await readFile(archive)
+    const realFetch = globalThis.fetch
+    const calls = []
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      calls.push(u)
+      if (u === `https://api.github.com/repos/zigtools/zls/releases/latest`) {
+        return new Response(JSON.stringify({ assets: [
+          { name: asset, browser_download_url: `https://example.invalid/${asset}` },
+          // A .minisig decoy that must not match the asset suffix.
+          { name: `${asset}.minisig`, browser_download_url: `https://example.invalid/${asset}.minisig` },
+        ] }))
+      }
+      if (u === `https://example.invalid/${asset}`) return new Response(bytes)
+      throw new Error(`unexpected fetch ${u}`)
+    }
+    const binDir = join(root, "lsp-bin")
+    const stubBin = join(root, "stub-bin")
+    await mkdir(stubBin)
+    const noToolchain = join(root, "void-bin")
+    await mkdir(noToolchain)
+    try {
+      // v1 refused to fetch zls without the zig toolchain; the precondition must hold.
+      await assert.rejects(
+        () => ensureServer({ id: "zls", command: [], extensions: [".zig"], env: {}, download: true }, join(binDir, "no-zig"), { PATH: noToolchain }),
+        /zig is not installed/,
+      )
+      const zig = join(stubBin, "zig")
+      await writeFile(zig, "#!/bin/sh\nexit 0\n")
+      await chmod(zig, 0o755)
+      const command = await ensureServer({ id: "zls", command: [], extensions: [".zig"], env: {}, download: true }, binDir, { ...process.env, PATH: `${stubBin}:${process.env.PATH}` })
+      assert.deepEqual(command, [join(binDir, "zls", "zls")])
+      assert.equal(await access(join(binDir, "zls", "zls"), constants.CAN_EXECUTE).then(() => true, () => false), true, "the unpacked zls binary must be executable")
+      assert.deepEqual(calls, [`https://api.github.com/repos/zigtools/zls/releases/latest`, `https://example.invalid/${asset}`])
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("the hashicorp flow downloads the platform build named by the releases API", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-hashicorp-")))
+  try {
+    const arch = process.arch === "arm64" ? "arm64" : "amd64"
+    const platform = process.platform === "win32" ? "windows" : process.platform
+    const expected = `https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_${platform}_${arch}.zip`
+    const realFetch = globalThis.fetch
+    let requested
+    globalThis.fetch = async (url) => {
+      const u = String(url)
+      if (u === "https://api.releases.hashicorp.com/v1/releases/terraform-ls/latest") {
+        return new Response(JSON.stringify({ version: "0.39.0", builds: [{ arch, os: platform, url: expected }] }))
+      }
+      requested = u
+      throw new Error("stop once the build url is requested")
+    }
+    const binDir = join(root, "lsp-bin")
+    let failure
+    try {
+      await ensureServer({ id: "terraform", command: [], extensions: [".tf"], env: {}, download: true }, binDir, { ...process.env })
+    } catch (error) {
+      failure = error
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    assert.equal(requested, expected, "the generic <name>_<version>.zip URL 404s; the build url from the API is the real one")
+    assert.ok(failure, "the flow must fail once the build download is refused")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("shutdown clears rows for servers that failed to start", async () => {
+  const root = await project({ broken: { command: ["/nonexistent/lsp-binary"], extensions: [".ts"] } })
+  const { after, cleanup, emitted, status } = await start(root)
+  try {
+    await writeFile(join(root, "f.ts"), "ERROR\n")
+    const event = completed("edit", { path: "f.ts" }, { content: "Edited f.ts" })
+    await after(event)
+    assert.ok(emitted.some((entry) => entry.name === "failed" && entry.data.id === "broken"), "the failed start must be reported")
+    assert.deepEqual(await status(), { configured: true, servers: [{ id: "broken", root, status: "broken" }] })
+    await cleanup()
+    assert.ok(emitted.some((entry) => entry.name === "shutdown" && entry.data.id === "broken"), "shutdown must clear the broken row")
+    assert.deepEqual(await status(), { configured: true, servers: [] })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("typescript and astro get the workspace's tsserver passed to them; without one they do not start", async () => {
+  // With a resolvable typescript in the project, the resolved tsserver is handed to the server.
+  const root = await project({ typescript: { command: ["FAKE"], env: { FAKE_LOG: "LOG" } } })
+  const log = join(root, "lsp.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.typescript.env.FAKE_LOG = log
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const tsserver = join(root, "node_modules", "typescript", "lib", "tsserver.js")
+  await mkdir(join(root, "node_modules", "typescript", "lib"), { recursive: true })
+  await writeFile(join(root, "node_modules", "typescript", "package.json"), JSON.stringify({ name: "typescript", version: "5.9.0" }))
+  await writeFile(tsserver, "module.exports = {}")
+  const { after, status, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ERROR\n")
+    await after(completed("write", { path: "a.ts" }, { content: "Wrote a.ts" }))
+    const init = await waitForLog(log, "initialize")
+    assert.deepEqual(init.initializationOptions?.tsserver, { path: tsserver })
+    assert.deepEqual(await status(), { configured: true, servers: [{ id: "typescript", root, status: "connected" }] })
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+
+  // Without a resolvable typescript the server does not start and leaves no row behind.
+  const bare = await project({ typescript: { command: ["FAKE"] } })
+  const { after: bareAfter, lsp, emitted, status: bareStatus, cleanup: bareCleanup } = await start(bare)
+  try {
+    await writeFile(join(bare, "a.ts"), "ERROR\n")
+    await bareAfter(completed("write", { path: "a.ts" }, { content: "Wrote a.ts" }))
+    assert.deepEqual(await bareStatus(), { configured: true, servers: [] })
+    assert.ok(!emitted.some((entry) => entry.name === "failed"), "no failed row without a workspace tsserver")
+    await assert.rejects(lsp.execute({ operation: "hover", path: "a.ts", line: 1, character: 1 }, {}), /tsserver\.js/)
+  } finally {
+    await bareCleanup()
+    await rm(bare, { recursive: true, force: true })
   }
 })
 

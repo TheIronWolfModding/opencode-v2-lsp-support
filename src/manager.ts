@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 import { abortable } from "./cancellation.ts"
 import { BUILTIN_ROOTS, languageIdForExtension } from "./catalog.ts"
-import { LspClient, LspError, errorMessage, type Diagnostic } from "./client.ts"
+import { endPosition, LspClient, LspError, errorMessage, syncKindOf, type Diagnostic } from "./client.ts"
 import type { ServerConfig, Settings } from "./config.ts"
 
 // After the first fresh push, a server that stays quiet this long is done publishing for now.
@@ -22,6 +22,8 @@ interface Target {
   readonly key: string
   readonly server: ServerConfig
   readonly root: string
+  /** OpenCode 1's tsserver hand-off for the typescript and astro servers. */
+  readonly initialization?: Record<string, unknown>
 }
 
 interface Entry {
@@ -29,7 +31,10 @@ interface Entry {
   starting?: Promise<LspClient>
   broken?: string
   warmed?: boolean
-  readonly opened: Set<string>
+  /** Open documents with the text the server holds for them, so incremental servers get valid ranges. */
+  readonly opened: Map<string, string>
+  serverID: string
+  root: string
 }
 
 interface Synced {
@@ -89,6 +94,17 @@ export function within(root: string, file: string): boolean {
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
 
+/** OpenCode 1's dedupe: the same code/severity/message/source/range reported twice counts once. */
+function dedupeDiagnostics(items: Diagnostic[]): Diagnostic[] {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    const key = JSON.stringify({ code: item.code, severity: item.severity, message: item.message, source: item.source, range: item.range })
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 /** The directory a server runs in for this file, or undefined when the server does not apply to it. */
 export async function serverRoot(id: string, file: string, project: string): Promise<string | undefined> {
   const rule = BUILTIN_ROOTS[id]
@@ -106,6 +122,19 @@ async function nearest(file: string, stop: string, markers: string[]): Promise<s
       if (await access(join(dir, marker)).then(() => true, () => false)) return dir
     }
     if (dir === stop || dir === dirname(dir)) return undefined
+  }
+}
+
+/**
+ * The workspace's tsserver, as OpenCode 1's Module.resolve found it: node's
+ * resolution of `typescript/lib/tsserver.js` from the file's directory, node
+ * modules and all, up to the filesystem root.
+ */
+async function resolveTsserver(file: string): Promise<string | undefined> {
+  for (let dir = dirname(file); ; dir = dirname(dir)) {
+    const candidate = join(dir, "node_modules", "typescript", "lib", "tsserver.js")
+    if (await access(candidate).then(() => true, () => false)) return candidate
+    if (dir === dirname(dir)) return undefined
   }
 }
 
@@ -127,18 +156,25 @@ export class LspManager {
   readonly #published = new Map<string, Map<string, Published>>()
   readonly #listeners = new Map<string, Set<() => void>>()
   readonly #queues = new Map<string, Promise<void>>()
+  readonly #onServer: ((kind: string, id: string, root: string) => void | Promise<void>) | undefined
+  readonly #resolve: ((server: ServerConfig) => Promise<string[]>) | undefined
   #closed = false
 
-  constructor(settings: Settings, root: string) {
+  constructor(settings: Settings, root: string, onServer?: (kind: string, id: string, root: string) => void | Promise<void>, resolve?: (server: ServerConfig) => Promise<string[]>) {
     this.#settings = settings
     this.#root = root
+    this.#onServer = onServer
+    this.#resolve = resolve
   }
 
   serversFor(file: string): ServerConfig[] {
     const key = extensionKey(file)
     const name = basename(file).toLowerCase()
-    return this.#settings.servers.filter((server) =>
-      server.extensions.some((extension) => [key, name].includes(extension.toLowerCase())),
+    return this.#settings.servers.filter(
+      // OpenCode 1: a configured server with an empty extension list applies to every file.
+      (server) =>
+        server.extensions.length === 0 ||
+        server.extensions.some((extension) => [key, name].includes(extension.toLowerCase())),
     )
   }
 
@@ -147,8 +183,26 @@ export class LspManager {
     for (const server of this.serversFor(file)) {
       const root = await serverRoot(server.id, file, this.#root)
       if (!root) continue
+      // typescript-language-server 6 carries no tsserver of its own and exits on
+      // initialize without one. OpenCode 1 resolved the workspace's copy and
+      // passed it as an initialization option, and never started the servers
+      // without it; the port does the same.
+      let initialization: Record<string, unknown> | undefined
+      if (server.id === "typescript" || server.id === "astro") {
+        const option = server.id === "typescript" ? "tsserver" : "typescript"
+        const own = (server.initialization?.[option] ?? {}) as Record<string, unknown>
+        const supplied = typeof own.path === "string" || typeof own.tsdk === "string"
+        if (!supplied) {
+          const tsserver = await resolveTsserver(file)
+          if (!tsserver) continue
+          initialization = {
+            ...server.initialization,
+            [option]: server.id === "typescript" ? { path: tsserver } : { tsdk: dirname(tsserver) },
+          }
+        }
+      }
       const key = root === this.#root ? server.id : `${server.id} (${relative(this.#root, root)})`
-      targets.push({ key, server, root })
+      targets.push({ key, server, root, initialization })
     }
     return targets
   }
@@ -217,14 +271,22 @@ export class LspManager {
     for (const { target, client } of ready) {
       const entry = this.#entries.get(target.key)!
       const sentAt = Date.now()
+      // OpenCode 1 announced the file through the watched-files event first, so workspace
+      // watchers (rust-analyzer, for one) also see files they have not opened.
+      client.notify("workspace/didChangeWatchedFiles", { changes: [{ uri, type: entry.opened.has(uri) ? 2 : 1 }] })
       if (entry.opened.has(uri)) {
-        client.notify("textDocument/didChange", { textDocument: { uri, version }, contentChanges: [{ text }] })
+        // A server that only accepts incremental sync gets the same whole-document
+        // replacement OpenCode 1 sent: its old text, replaced from the start to its end.
+        const changes = syncKindOf(client.capabilities) === 2
+          ? [{ range: { start: { line: 0, character: 0 }, end: endPosition(entry.opened.get(uri) ?? "") }, text }]
+          : [{ text }]
+        client.notify("textDocument/didChange", { textDocument: { uri, version }, contentChanges: changes })
       } else {
         client.notify("textDocument/didOpen", {
           textDocument: { uri, languageId: languageIdForExtension(extensionKey(file)), version, text },
         })
-        entry.opened.add(uri)
       }
+      entry.opened.set(uri, text)
       // Edit tools write to disk, and some servers (rust-analyzer, for one) only re-check on save.
       const save = client.capabilities.textDocumentSync?.save
       if (save === true || (save && typeof save === "object")) {
@@ -260,29 +322,58 @@ export class LspManager {
 
   async #collect(client: LspClient, uri: string, version: number, since: number, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | undefined> {
     signal?.throwIfAborted()
-    if (client.capabilities.diagnosticProvider) {
+    // OpenCode 1 pulled from the static `diagnosticProvider` and from dynamically registered
+    // providers alike; servers such as eclipse.jdt.ls only answer after a registration.
+    const pull = client.documentPullState
+    if (pull.supported) {
       try {
         // A pull answers for the contents the server held when the request arrived. Sending it from
         // the file's queue pins that version; if a later sync replaced it meanwhile, ask again.
         for (let attempt = 0; attempt < PULL_ATTEMPTS; attempt++) {
-          const { sent, response } = await abortable(this.#serialize(uri, async () => {
+          const { sent, responses } = await abortable(this.#serialize(uri, async () => {
             signal?.throwIfAborted()
-            const response = client.request("textDocument/diagnostic", { textDocument: { uri } }, Math.min(timeoutMs, PULL_TIMEOUT_MS), signal)
-            // Cancellation can win before the queue returns this nested promise to its caller.
-            void response.catch(() => undefined)
-            return {
-              sent: this.#versions.get(uri),
-              response,
-            }
+            // Base provider plus every registered identifier, in parallel, as OpenCode 1 pulled them.
+            const responses = [
+              client.request("textDocument/diagnostic", { textDocument: { uri } }, Math.min(timeoutMs, PULL_TIMEOUT_MS), signal),
+              ...pull.identifiers.map((identifier) =>
+                client.request("textDocument/diagnostic", { identifier, textDocument: { uri } }, Math.min(timeoutMs, PULL_TIMEOUT_MS), signal),
+              ),
+            ]
+            // Cancellation can win before the queue returns these nested promises to their caller.
+            for (const response of responses) void response.catch(() => undefined)
+            return { sent: this.#versions.get(uri), responses }
           }), signal)
-          const report = await response
+          const reports = await Promise.allSettled(responses)
+          // Only reports for the version this attempt sent count; a slower answer after a
+          // later sync describes contents that are already gone.
           if (this.#deleted.has(uri)) return undefined
           if (sent === undefined || this.#versions.get(uri) !== sent) continue
-          if (report?.kind === "full" && Array.isArray(report.items)) {
-            this.#store(client.id, uri, report.items, sent)
-            return report.items
+          let handled = false
+          let unchanged = false
+          const items: Diagnostic[] = []
+          for (const settled of reports) {
+            if (settled.status === "rejected") continue
+            const report = settled.value
+            if (report?.kind === "unchanged") {
+              unchanged = true
+              continue
+            }
+            const reportItems = Array.isArray(report?.items) ? report.items : undefined
+            if (reportItems === undefined) continue
+            handled = true
+            items.push(...reportItems)
+            // Related-document reports describe other files; store them per file so the
+            // other-files report can show them, as OpenCode 1 merged them.
+            for (const [relatedUri, related] of Object.entries((report?.relatedDocuments ?? {}) as Record<string, any>)) {
+              if (relatedUri.startsWith("file:") && Array.isArray(related?.items)) this.#store(client.id, relatedUri, related.items, undefined)
+            }
           }
-          if (report?.kind === "unchanged") return this.#published.get(client.id)?.get(uri)?.diagnostics
+          if (handled) {
+            const merged = dedupeDiagnostics(items)
+            this.#store(client.id, uri, merged, sent)
+            return merged
+          }
+          if (unchanged) return this.#published.get(client.id)?.get(uri)?.diagnostics
           break
         }
       } catch (error) {
@@ -343,7 +434,19 @@ export class LspManager {
     signal?.throwIfAborted()
     if (this.serversFor(file).length === 0) throw new Error("No LSP server available for this file type.")
     const targets = await abortable(this.#targets(file), signal)
-    if (targets.length === 0) throw new Error("No configured LSP server applies to this file's project.")
+    if (targets.length === 0) {
+      let typescript: ServerConfig | undefined
+      for (const server of this.serversFor(file)) {
+        if (server.id !== "typescript" && server.id !== "astro") continue
+        if (await serverRoot(server.id, file, this.#root)) {
+          typescript = server
+          break
+        }
+      }
+      if (typescript && !(await resolveTsserver(file)))
+        throw new Error(`No LSP server for this file: ${typescript.id} needs a resolvable typescript/lib/tsserver.js; add the typescript package to the project.`)
+      throw new Error("No configured LSP server applies to this file's project.")
+    }
     const cold = targets.some((target) => !this.#entries.get(target.key)?.warmed)
     if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS, signal)
     else await this.sync(file, signal)
@@ -361,15 +464,22 @@ export class LspManager {
     }
     const capable = clients.filter((client) => client.capabilities[capability])
     if (capable.length === 0) throw new Error(`No LSP server for this file supports ${capability}.`)
-    const results = await Promise.all(capable.map(send))
+    // OpenCode 1 caught every server's failure per-client and merged the answers that
+    // succeeded, so one misbehaving server must not sink the request when others answer;
+    // only when every server fails is the first reason reported.
+    const settled = await Promise.allSettled(capable.map(send))
+    if (signal?.aborted) throw signal.reason
+    const results = settled.flatMap((outcome) => (outcome.status === "fulfilled" ? [outcome.value] : []))
+    if (results.length === 0) throw (settled.find((outcome) => outcome.status === "rejected") as PromiseRejectedResult).reason
     return results.flatMap((result) => (result === null || result === undefined ? [] : Array.isArray(result) ? result : [result]))
   }
 
-  async #client({ key, server, root }: Target): Promise<LspClient> {
+  async #client(target: Target): Promise<LspClient> {
+    const { key, server, root } = target
     if (this.#closed) throw new Error("LSP is shut down")
     let entry = this.#entries.get(key)
     if (!entry) {
-      entry = { opened: new Set() }
+      entry = { opened: new Map(), serverID: server.id, root }
       this.#entries.set(key, entry)
     }
     if (entry.broken) throw new Error(entry.broken)
@@ -379,34 +489,48 @@ export class LspManager {
     current.opened.clear()
     current.warmed = false
     this.#published.delete(key)
-    const client = new LspClient({
-      id: key,
-      command: server.command,
-      root,
-      rootUri: pathToFileURL(root).href,
-      env: server.env,
-      initialization: server.initialization,
-      initializeTimeoutMs: this.#settings.initializeTimeoutMs,
-      requestTimeoutMs: this.#settings.requestTimeoutMs,
-      onDiagnostics: (uri, diagnostics, version) => this.#store(key, uri, diagnostics, version),
-      onActivity: () => this.#notify(key),
-      onExit: () => {
-        if (current.client === client) current.client = undefined
-      },
-      debug: this.#settings.debug,
-    })
-    current.starting = client
-      .start()
-      .then(() => {
-        current.client = client
+    let client: LspClient | undefined
+    // The download resolver runs inside the starting chain so a failed fetch
+    // marks the row broken, like a failed spawn does.
+    current.starting = (async () => {
+      const command = this.#resolve ? await this.#resolve(server) : server.command
+      client = new LspClient({
+        id: key,
+        command,
+        root,
+        rootUri: pathToFileURL(root).href,
+        env: server.env,
+        initialization: target.initialization ?? server.initialization,
+        initializeTimeoutMs: this.#settings.initializeTimeoutMs,
+        requestTimeoutMs: this.#settings.requestTimeoutMs,
+        onDiagnostics: (uri, diagnostics, version) => this.#store(key, uri, diagnostics, version),
+        onActivity: () => this.#notify(key),
+        onExit: () => {
+          // shutdown() stops live servers on purpose (e.g. a plugin reload); that
+          // is a shutdown event, not a crashed server, so #closed keeps it green-free.
+          if (this.#closed) return
+          if (current.client === client) {
+            current.client = undefined
+            this.#notifyServer("failed", server.id, root)
+          }
+        },
+        debug: this.#settings.debug,
+      })
+      await client.start()
+      return client
+    })()
+      .then((started) => {
+        current.client = started
         this.#log(`${key} started`)
-        return client
+        this.#notifyServer("connected", server.id, root)
+        return started
       })
       .catch(async (error) => {
         // A server that cannot start stays off for this instance instead of costing every edit a retry.
         current.broken = errorMessage(error)
         this.#log(current.broken)
-        await client.stop()
+        this.#notifyServer("failed", server.id, root)
+        if (client) await client.stop()
         throw error
       })
       .finally(() => {
@@ -430,6 +554,24 @@ export class LspManager {
     for (const listener of [...(this.#listeners.get(serverID) ?? [])]) listener()
   }
 
+  /** Tell the plugin's lifecycle listener about a server row; used for the terminal sidebar. */
+  async #notifyServer(kind: string, id: string, root: string): Promise<void> {
+    try {
+      await this.#onServer?.(kind, id, root)
+    } catch {
+      // Notification is best-effort; a failed listener must not break server management.
+    }
+  }
+
+  /** Rows for the terminal sidebar: one per server and root that was started or attempted. */
+  snapshot(): { id: string; root: string; status: "connected" | "starting" | "broken" }[] {
+    return [...this.#entries.values()].map((entry) => ({
+      id: entry.serverID,
+      root: entry.root,
+      status: entry.broken ? "broken" : entry.client?.running ? "connected" : "starting",
+    }))
+  }
+
   #log(message: string): void {
     if (this.#settings.debug) console.error(`[lsp] ${message}`)
   }
@@ -438,12 +580,16 @@ export class LspManager {
     this.#closed = true
     const entries = [...this.#entries.values()]
     this.#entries.clear()
+    // Stop every server first, awaiting in-flight startups, so their exit
+    // handlers see #closed and stay quiet.
     await Promise.all(
       entries.map(async (entry) => {
         const client = entry.client ?? (await entry.starting?.catch(() => undefined))
         await client?.stop()
       }),
     )
+    // Then clear every row the sidebar saw, including rows that never connected.
+    await Promise.all(entries.map((entry) => this.#notifyServer("shutdown", entry.serverID, entry.root)))
   }
 }
 

@@ -12,6 +12,7 @@ import {
   formatWorkspaceSymbols,
 } from "./format.ts"
 import { requestWithRetry, within, type LspManager } from "./manager.ts"
+import { isRecord } from "./config.ts"
 
 const OPERATIONS = [
   "goToDefinition",
@@ -116,8 +117,12 @@ async function run(manager: LspManager, root: string, file: string, input: Input
       return formatHover(await ask("hoverProvider", "textDocument/hover", { textDocument, position: position() }))
     case "documentSymbol":
       return list(formatDocumentSymbols(await ask("documentSymbolProvider", "textDocument/documentSymbol", { textDocument }), root))
-    case "workspaceSymbol":
-      return list(formatWorkspaceSymbols(await ask("workspaceSymbolProvider", "workspace/symbol", { query: input.query ?? "" }), root))
+    case "workspaceSymbol": {
+      // OpenCode 1 kept only the meaningful kinds; file/module/package noise is dropped.
+      const kinds = new Set([5, 6, 10, 11, 12, 13, 14, 23]) // Class, Method, Enum, Interface, Function, Variable, Constant, Struct
+      const symbols = await ask("workspaceSymbolProvider", "workspace/symbol", { query: input.query ?? "" })
+      return list(formatWorkspaceSymbols(symbols.filter((item) => isRecord(item) && typeof item.kind === "number" && kinds.has(item.kind)), root))
+    }
     case "prepareCallHierarchy":
       return list(callItems(await ask("callHierarchyProvider", "textDocument/prepareCallHierarchy", { textDocument, position: position() }), root))
     case "incomingCalls":

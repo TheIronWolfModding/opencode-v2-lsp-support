@@ -2,6 +2,8 @@ import { existsSync, readFileSync, realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { BUILTIN_EXTENSIONS } from "./catalog.ts"
+import { discoverServers } from "./discover.ts"
+import { DEFAULT_BIN_DIR } from "./download.ts"
 import { parseJsonc } from "./jsonc.ts"
 
 export interface ServerConfig {
@@ -11,6 +13,8 @@ export interface ServerConfig {
   readonly extensions: string[]
   readonly env: Record<string, string>
   readonly initialization?: Record<string, unknown>
+  /** OpenCode 1's on-demand install is pending: command resolves on first use. */
+  readonly download?: boolean
 }
 
 export interface Settings {
@@ -20,6 +24,7 @@ export interface Settings {
   readonly initializeTimeoutMs: number
   readonly requestTimeoutMs: number
   readonly debug: boolean
+  readonly binDir: string
 }
 
 const NAMES = ["opencode.json", "opencode.jsonc"]
@@ -36,14 +41,26 @@ export function resolveSettings(directory: string, options: Record<string, unkno
   }
   if (options.lsp !== undefined) lsp = mergeLsp(lsp, options.lsp)
   const debug = options.debug === true
+  const discovered =
+    options.discover === false
+      ? []
+      : discoverServers(lsp, directory, env, { experimentalTy: options.experimentalTy === true, download: options.download === true })
   return {
-    servers: resolveServers(lsp, debug),
+    servers: [...resolveServers(lsp, debug), ...discovered],
     diagnostics: options.diagnostics !== false,
     diagnosticsTimeoutMs: positive(options.diagnosticsTimeoutMs, 5_000),
     initializeTimeoutMs: positive(options.initializeTimeoutMs, 45_000),
     requestTimeoutMs: positive(options.requestTimeoutMs, 15_000),
     debug,
+    binDir: resolveBinDir(options.binDir),
   }
+}
+
+/** The `binDir` option: empty or absent keeps the default; `~/` expands to the home directory. */
+function resolveBinDir(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") return DEFAULT_BIN_DIR
+  const expanded = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value
+  return resolve(expanded)
 }
 
 /** Configuration documents from lowest to highest precedence. */
@@ -146,11 +163,10 @@ function resolveServers(lsp: unknown, debug: boolean): ServerConfig[] {
       continue
     }
     const declared = strings(entry.extensions)
+    // OpenCode 1: a configured ID with no extensions matches every file; custom IDs without
+    // them behave the same way it did.
     const extensions = [...new Set((declared.length ? declared : (BUILTIN_EXTENSIONS[id] ?? [])).map((item) => item.trim().toLowerCase()))].filter(Boolean)
-    if (extensions.length === 0) {
-      console.error(`[lsp] ${id} has no extensions and is not a known OpenCode server; it matches no files`)
-      continue
-    }
+    if (extensions.length === 0 && debug) console.error(`[lsp] ${id} has no extensions; like OpenCode 1 it matches every file`)
     servers.push({
       id,
       command,
